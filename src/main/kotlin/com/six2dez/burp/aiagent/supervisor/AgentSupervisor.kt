@@ -1,0 +1,1166 @@
+package com.six2dez.burp.aiagent.supervisor
+
+import burp.api.montoya.MontoyaApi
+import com.six2dez.burp.aiagent.audit.ActivityType
+import com.six2dez.burp.aiagent.audit.AiRequestLogger
+import com.six2dez.burp.aiagent.audit.AuditLogger
+import com.six2dez.burp.aiagent.backends.AgentConnection
+import com.six2dez.burp.aiagent.backends.BackendLaunchConfig
+import com.six2dez.burp.aiagent.backends.BackendRegistry
+import com.six2dez.burp.aiagent.backends.DiagnosableConnection
+import com.six2dez.burp.aiagent.backends.HealthCheckResult
+import com.six2dez.burp.aiagent.backends.http.MontoyaHttpTransport
+import com.six2dez.burp.aiagent.config.AgentSettings
+import com.six2dez.burp.aiagent.config.Defaults
+import com.six2dez.burp.aiagent.redact.PrivacyMode
+import com.six2dez.burp.aiagent.util.HeaderParser
+import java.util.UUID
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+class AgentSupervisor(
+    private val api: MontoyaApi,
+    private val registry: BackendRegistry,
+    private val audit: AuditLogger,
+    private val workerPool: ExecutorService,
+) {
+    var aiRequestLogger: AiRequestLogger? = null
+
+    data class Status(
+        val state: String,
+        val backendId: String?,
+    )
+
+    data class BackendInfo(
+        val backendId: String,
+        val displayName: String,
+        val model: String?,
+    )
+
+    private sealed class AgentState {
+        data object Idle : AgentState()
+
+        data class Starting(
+            val backendId: String,
+        ) : AgentState()
+
+        data class Running(
+            val backendId: String,
+            val sessionId: String,
+            val connection: AgentConnection,
+            val launchConfig: BackendLaunchConfig,
+            val startedAt: Long,
+        ) : AgentState()
+    }
+
+    private val stateRef = AtomicReference<AgentState>(AgentState.Idle)
+    private val settingsRef = AtomicReference<AgentSettings?>(null)
+    private val lastErrorRef = AtomicReference<String?>(null)
+    private val crashCount = AtomicInteger(0)
+    private val lastRestartAt = AtomicLong(0)
+    private val autoRestartSuppressed = AtomicReference<String?>(null)
+    private val immediateCrashCount = AtomicInteger(0)
+    private val chatSessionManager = ChatSessionManager()
+    internal val httpTransport = MontoyaHttpTransport(api)
+    private val services = java.util.concurrent.ConcurrentHashMap<String, Process>()
+    private val lifecycleLock = ReentrantLock()
+    private val monitorExec = Executors.newSingleThreadScheduledExecutor()
+
+    init {
+        monitorExec.scheduleAtFixedRate(
+            { checkHealth() },
+            Defaults.HEALTH_CHECK_INTERVAL_MS,
+            Defaults.HEALTH_CHECK_INTERVAL_MS,
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    fun applySettings(settings: AgentSettings) {
+        settingsRef.set(settings)
+    }
+
+    /**
+     * Returns the state of Burp Pro's built-in **"Use AI" for extensions** preference.
+     *
+     * IMPORTANT: this flag is *only* relevant to the `burp-ai` backend, which delegates inference
+     * to Burp Pro's bundled AI provider. Every other backend in this plugin (CLI agents like
+     * Claude Code / Codex / Gemini, plus HTTP backends like Ollama, LM Studio, OpenAI-compatible,
+     * NVIDIA NIM, Perplexity) is independent of Burp's AI features and must keep working when the
+     * toggle is off — including in Burp Community where the toggle does not exist at all.
+     *
+     * Callers should prefer [requiresBurpAiAndDisabled] to gate startup / send paths, so non-AI
+     * backends are not accidentally blocked by Burp's preference.
+     */
+    fun isAiEnabled(): Boolean =
+        try {
+            api.ai().isEnabled()
+        } catch (_: Exception) {
+            false
+        }
+
+    /**
+     * `true` iff [backendId] is the Burp-bundled `burp-ai` backend AND Burp Pro's `Use AI`
+     * preference is currently OFF. Used to short-circuit start / send paths with a clear error
+     * message; non-AI backends always return `false` regardless of the preference.
+     */
+    fun requiresBurpAiAndDisabled(backendId: String): Boolean = backendId == "burp-ai" && !isAiEnabled()
+
+    /**
+     * `true` iff the currently-running backend is `burp-ai` AND Burp Pro's `Use AI` toggle is OFF.
+     * Returns false when no backend is running, or when the running backend doesn't depend on
+     * Burp's bundled AI. Background scanners use this to skip work that would fail at send time.
+     */
+    fun isBlockedByBurpAiGate(): Boolean {
+        val running = stateRef.get() as? AgentState.Running ?: return false
+        return requiresBurpAiAndDisabled(running.backendId)
+    }
+
+    fun currentSessionId(): String? = (stateRef.get() as? AgentState.Running)?.sessionId
+
+    fun lastStartError(): String? = lastErrorRef.get()
+
+    fun startOrAttach(backendId: String): Boolean {
+        if (requiresBurpAiAndDisabled(backendId)) {
+            val msg = "Burp AI is disabled in Burp Suite settings. Enable 'Use AI' for extensions, or pick a different backend."
+            lastErrorRef.set(msg)
+            api.logging().logToOutput(msg)
+            return false
+        }
+
+        // Phase 1: Acquire lock, transition state, prepare config — then release lock
+        val backend: com.six2dez.burp.aiagent.backends.AiBackend
+        val sessionId: String
+        val launchConfig: BackendLaunchConfig
+        val startingState: AgentState.Starting
+
+        lifecycleLock.withLock {
+            lastErrorRef.set(null)
+            autoRestartSuppressed.set(null)
+            immediateCrashCount.set(0)
+
+            // Check if already running the requested backend
+            val current = stateRef.get()
+            if (current is AgentState.Running && current.backendId == backendId && current.connection.isAlive()) {
+                return true
+            }
+
+            // Reject if another start is in progress
+            if (current is AgentState.Starting) {
+                val msg = "Backend startup already in progress: ${current.backendId}"
+                lastErrorRef.set(msg)
+                api.logging().logToError(msg)
+                return false
+            }
+
+            stop()
+
+            val resolved = registry.get(backendId)
+            if (resolved == null) {
+                val msg = "Backend not found: $backendId"
+                lastErrorRef.set(msg)
+                api.logging().logToError(msg)
+                return false
+            }
+            backend = resolved
+
+            sessionId = "session-" + UUID.randomUUID().toString()
+            launchConfig = buildLaunchConfig(backendId, sessionId, embeddedMode = true)
+
+            // Set transitional STARTING state before releasing lock.
+            // Keep a reference for the CAS below (AtomicReference uses identity comparison).
+            startingState = AgentState.Starting(backendId)
+            stateRef.set(startingState)
+        }
+
+        // Phase 2: Launch backend outside lock (may block for CLI processes)
+        return try {
+            api.logging().logToOutput("Launching backend $backendId with config: $launchConfig")
+            val conn = backend.launch(launchConfig)
+
+            val newState =
+                AgentState.Running(
+                    backendId = backendId,
+                    sessionId = sessionId,
+                    connection = conn,
+                    launchConfig = launchConfig,
+                    startedAt = System.currentTimeMillis(),
+                )
+
+            // Only transition if still in STARTING state (stop() may have been called).
+            // Uses the same instance reference set above — AtomicReference.compareAndSet
+            // checks identity (===), not structural equality.
+            if (stateRef.compareAndSet(startingState, newState)) {
+                audit.logEvent("session_start", mapOf("backendId" to backendId, "sessionId" to sessionId, "config" to launchConfig))
+                true
+            } else {
+                // Another thread called stop() while we were launching — clean up
+                conn.stop()
+                false
+            }
+        } catch (e: Exception) {
+            val msg = "Failed to launch backend $backendId: ${e.message}"
+            lastErrorRef.set(msg)
+            api.logging().logToError(msg)
+            // Reset to Idle if still in STARTING
+            stateRef.compareAndSet(startingState, AgentState.Idle)
+            false
+        }
+    }
+
+    fun isOllamaHealthy(settings: AgentSettings): Boolean = registry.healthCheck("ollama", settings).isReachable
+
+    fun startOllamaService(settings: AgentSettings): Boolean {
+        val cmd = settings.ollamaServeCmd
+        if (cmd.isBlank()) {
+            api.logging().logToError("Ollama serve command is empty.")
+            return false
+        }
+        return startService("ollama-serve", cmd)
+    }
+
+    fun isLmStudioHealthy(settings: AgentSettings): Boolean = registry.healthCheck("lmstudio", settings).isReachable
+
+    fun startLmStudioService(settings: AgentSettings): Boolean {
+        val cmd = settings.lmStudioServerCmd
+        if (cmd.isBlank()) {
+            api.logging().logToError("LM Studio server command is empty.")
+            return false
+        }
+        return startService("lmstudio-server", cmd)
+    }
+
+    fun isBackendHealthy(settings: AgentSettings): Boolean = backendHealth(settings).isHealthy
+
+    fun backendHealth(settings: AgentSettings): HealthCheckResult = registry.healthCheck(settings.preferredBackendId, settings)
+
+    fun stop() {
+        lifecycleLock.withLock {
+            val prev = stateRef.getAndSet(AgentState.Idle)
+            when (prev) {
+                is AgentState.Running -> {
+                    prev.connection.stop()
+                    audit.logEvent("session_stop", mapOf("backendId" to prev.backendId))
+                }
+                is AgentState.Starting -> {
+                    // Launch in progress — state set to Idle; the launching thread
+                    // will detect the CAS failure and clean up the connection.
+                    audit.logEvent("session_stop", mapOf("backendId" to prev.backendId, "note" to "cancelled_during_start"))
+                }
+                is AgentState.Idle -> { /* nothing */ }
+            }
+            autoRestartSuppressed.set(null)
+            immediateCrashCount.set(0)
+        }
+    }
+
+    fun restart(): Boolean {
+        return lifecycleLock.withLock {
+            val current = stateRef.get()
+            if (current !is AgentState.Running) return@withLock false
+            val backendId = current.backendId
+            stop()
+            startOrAttach(backendId)
+        }
+    }
+
+    fun send(
+        text: String,
+        history: List<com.six2dez.burp.aiagent.backends.ChatMessage>? = null,
+        contextJson: String?,
+        privacyMode: PrivacyMode,
+        determinismMode: Boolean,
+        onChunk: (String) -> Unit,
+        onComplete: (Throwable?) -> Unit,
+        traceId: String? = null,
+        systemPrompt: String? = null,
+        jsonMode: Boolean = false,
+        maxOutputTokens: Int? = null,
+    ) {
+        val current = stateRef.get()
+        if (current !is AgentState.Running) {
+            onComplete(IllegalStateException("No active session"))
+            return
+        }
+        if (requiresBurpAiAndDisabled(current.backendId)) {
+            onComplete(IllegalStateException("Burp AI is disabled in Burp Suite settings."))
+            return
+        }
+
+        if (!current.connection.isAlive()) {
+            onComplete(IllegalStateException("Session is not alive"))
+            return
+        }
+
+        val sessionId = current.sessionId
+        val backendId = current.backendId
+        val launchConfig = current.launchConfig
+        val resolvedTraceId = traceId ?: "agent-turn-" + UUID.randomUUID().toString()
+
+        if (audit.isEnabled()) {
+            val bundle =
+                audit.buildPromptBundle(
+                    sessionId = sessionId,
+                    backendId = backendId,
+                    backendConfig = launchConfig,
+                    promptText = text,
+                    contextJson = contextJson,
+                    privacyMode = privacyMode,
+                    determinismMode = determinismMode,
+                )
+            audit.logEvent("prompt", bundle)
+            audit.writePromptBundle(bundle)
+        }
+
+        api.logging().logToOutput("AI send: backend=$backendId session=$sessionId")
+        api.logging().logToOutput("AI connection: ${current.connection.javaClass.name}")
+
+        val sendStartMs = System.currentTimeMillis()
+        aiRequestLogger?.log(
+            type = ActivityType.PROMPT_SENT,
+            source = "agent",
+            backendId = backendId,
+            sessionId = sessionId,
+            detail = "Prompt sent (${text.length} chars)",
+            promptChars = text.length,
+            metadata =
+                mapOf(
+                    "operation" to "agent_send",
+                    "status" to "sent",
+                    "traceId" to resolvedTraceId,
+                ),
+        )
+
+        val responseAccumulator = StringBuilder()
+        current.connection.send(
+            text,
+            history = history,
+            onChunk = { chunk ->
+                responseAccumulator.append(chunk)
+                audit.logEvent("agent_chunk", mapOf("backendId" to backendId, "chunk" to chunk))
+                onChunk(chunk)
+            },
+            jsonMode = jsonMode,
+            maxOutputTokens = maxOutputTokens,
+            onComplete = { err ->
+                val durationMs = System.currentTimeMillis() - sendStartMs
+                audit.logEvent("prompt_complete", mapOf("backendId" to backendId, "error" to err?.message))
+                if (err != null) {
+                    api.logging().logToError("AI backend error ($backendId): ${err.message}")
+                    aiRequestLogger?.log(
+                        type = ActivityType.ERROR,
+                        source = "agent",
+                        backendId = backendId,
+                        sessionId = sessionId,
+                        detail = "Error: ${err.message}",
+                        durationMs = durationMs,
+                        promptChars = text.length,
+                        metadata =
+                            mapOf(
+                                "operation" to "agent_send",
+                                "status" to "error",
+                                "traceId" to resolvedTraceId,
+                                "errorClass" to err.javaClass.simpleName,
+                                "errorCode" to err.javaClass.simpleName,
+                            ),
+                    )
+                } else {
+                    aiRequestLogger?.log(
+                        type = ActivityType.RESPONSE_COMPLETE,
+                        source = "agent",
+                        backendId = backendId,
+                        sessionId = sessionId,
+                        detail = "Response received (${responseAccumulator.length} chars)",
+                        durationMs = durationMs,
+                        promptChars = text.length,
+                        responseChars = responseAccumulator.length,
+                        metadata =
+                            mapOf(
+                                "operation" to "agent_send",
+                                "status" to "ok",
+                                "traceId" to resolvedTraceId,
+                            ),
+                    )
+                }
+                onComplete(err)
+            },
+            systemPrompt = systemPrompt,
+        )
+    }
+
+    fun sendChat(
+        chatSessionId: String,
+        backendId: String,
+        text: String,
+        history: List<com.six2dez.burp.aiagent.backends.ChatMessage>? = null,
+        contextJson: String?,
+        privacyMode: PrivacyMode,
+        determinismMode: Boolean,
+        onChunk: (String) -> Unit,
+        onComplete: (Throwable?) -> Unit,
+        traceId: String? = null,
+        systemPrompt: String? = null,
+        maxOutputTokens: Int? = null,
+        launchMetadata: Map<String, String>? = null,
+    ): com.six2dez.burp.aiagent.backends.AgentConnection? {
+        if (requiresBurpAiAndDisabled(backendId)) {
+            onComplete(IllegalStateException("Burp AI is disabled in Burp Suite settings."))
+            return null
+        }
+
+        lastErrorRef.set(null)
+        val resolvedTraceId = traceId ?: "chat-turn-" + UUID.randomUUID().toString()
+        val backend = registry.get(backendId)
+        if (backend == null) {
+            onComplete(IllegalStateException("Backend not found: $backendId"))
+            return null
+        }
+
+        // Hoisted so the audit bundle (below) can read backend config in both
+        // existing-connection and new-connection paths.
+        val cliSessionId = chatSessionManager.cliSessionIdFor(chatSessionId, backendId)
+        val launchConfig =
+            buildLaunchConfig(
+                backendId,
+                chatSessionId,
+                embeddedMode = true,
+                cliSessionId = cliSessionId,
+            )
+
+        // Try to reuse an existing connection (for HTTP backends with conversation history)
+        val existingConn = chatSessionManager.existingConnectionFor(chatSessionId, backendId)
+        val connection: AgentConnection
+        if (existingConn != null) {
+            connection = existingConn
+        } else {
+            try {
+                connection = backend.launch(launchConfig)
+            } catch (e: Exception) {
+                val msg = "Failed to launch backend $backendId: ${e.message}"
+                lastErrorRef.set(msg)
+                api.logging().logToError(msg)
+                onComplete(e)
+                return null
+            }
+        }
+
+        if (audit.isEnabled()) {
+            val bundle =
+                audit.buildPromptBundle(
+                    sessionId = chatSessionId,
+                    backendId = backendId,
+                    backendConfig = launchConfig,
+                    promptText = text,
+                    contextJson = contextJson,
+                    privacyMode = privacyMode,
+                    determinismMode = determinismMode,
+                    promptSource = launchMetadata?.get("promptSource"),
+                    promptId = launchMetadata?.get("promptId"),
+                    promptTitle = launchMetadata?.get("promptTitle"),
+                    contextKind = launchMetadata?.get("contextKind"),
+                )
+            audit.logEvent("prompt", bundle)
+            audit.writePromptBundle(bundle)
+        }
+
+        api.logging().logToOutput("AI chat send: backend=$backendId chatSession=$chatSessionId")
+
+        val chatSendStartMs = System.currentTimeMillis()
+        aiRequestLogger?.log(
+            type = ActivityType.PROMPT_SENT,
+            source = "chat",
+            backendId = backendId,
+            sessionId = chatSessionId,
+            detail = "Chat prompt sent (${text.length} chars)",
+            promptChars = text.length,
+            metadata =
+                mapOf(
+                    "operation" to "chat_turn",
+                    "status" to "sent",
+                    "traceId" to resolvedTraceId,
+                ) + launchMetadata.orEmpty(),
+        )
+
+        val chatResponseAccumulator = StringBuilder()
+        connection.send(
+            text,
+            history = history,
+            onChunk = { chunk ->
+                chatResponseAccumulator.append(chunk)
+                audit.logEvent("agent_chunk", mapOf("backendId" to backendId, "chunk" to chunk))
+                onChunk(chunk)
+            },
+            systemPrompt = systemPrompt,
+            maxOutputTokens = maxOutputTokens,
+            onComplete = { err ->
+                val durationMs = System.currentTimeMillis() - chatSendStartMs
+                audit.logEvent("prompt_complete", mapOf("backendId" to backendId, "error" to err?.message))
+                if (err != null) {
+                    api.logging().logToError("AI backend error ($backendId): ${err.message}")
+                    aiRequestLogger?.log(
+                        type = ActivityType.ERROR,
+                        source = "chat",
+                        backendId = backendId,
+                        sessionId = chatSessionId,
+                        detail = "Chat error: ${err.message}",
+                        durationMs = durationMs,
+                        promptChars = text.length,
+                        metadata =
+                            mapOf(
+                                "operation" to "chat_turn",
+                                "status" to "error",
+                                "traceId" to resolvedTraceId,
+                                "errorClass" to err.javaClass.simpleName,
+                                "errorCode" to err.javaClass.simpleName,
+                            ) + launchMetadata.orEmpty(),
+                    )
+                } else {
+                    aiRequestLogger?.log(
+                        type = ActivityType.RESPONSE_COMPLETE,
+                        source = "chat",
+                        backendId = backendId,
+                        sessionId = chatSessionId,
+                        detail = "Chat response received (${chatResponseAccumulator.length} chars)",
+                        durationMs = durationMs,
+                        promptChars = text.length,
+                        responseChars = chatResponseAccumulator.length,
+                        metadata =
+                            mapOf(
+                                "operation" to "chat_turn",
+                                "status" to "ok",
+                                "traceId" to resolvedTraceId,
+                            ) + launchMetadata.orEmpty(),
+                    )
+                }
+                // Update session state after completion (stores cliSessionId or connection for reuse)
+                chatSessionManager.updateSession(chatSessionId, backendId, connection)
+                onComplete(err)
+            },
+        )
+        return connection
+    }
+
+    fun getBackend(backendId: String): com.six2dez.burp.aiagent.backends.AiBackend? = registry.get(backendId)
+
+    fun removeChatSession(chatSessionId: String) {
+        chatSessionManager.removeSession(chatSessionId)
+    }
+
+    /** Shutdown all live chat connections (e.g. on project change). */
+    fun shutdownAllChatSessions() {
+        chatSessionManager.shutdown()
+    }
+
+    fun status(): Status {
+        val current = stateRef.get()
+        return when (current) {
+            is AgentState.Idle -> Status("Idle", null)
+            is AgentState.Starting -> Status("Starting", current.backendId)
+            is AgentState.Running -> {
+                if (current.connection.isAlive()) {
+                    Status("Running", current.backendId)
+                } else {
+                    Status("Crashed", current.backendId)
+                }
+            }
+        }
+    }
+
+    fun getCurrentBackendInfo(): BackendInfo? {
+        val current = stateRef.get()
+        if (current !is AgentState.Running) return null
+
+        val config = current.launchConfig
+        return BackendInfo(
+            backendId = current.backendId,
+            displayName = config.displayName,
+            model = config.model,
+        )
+    }
+
+    private fun buildLaunchConfig(
+        backendId: String,
+        sessionId: String,
+        embeddedMode: Boolean,
+        cliSessionId: String? = null,
+    ): BackendLaunchConfig {
+        val prefs = api.persistence().preferences()
+        val settings = settingsRef.get()
+        val determinism = settings?.determinismMode ?: (prefs.getBoolean("determinism.enabled") ?: false)
+
+        val mcpSettings = settings?.mcpSettings
+        val mcpEnv =
+            if (mcpSettings != null && mcpSettings.enabled) {
+                val url = "http://${mcpSettings.host}:${mcpSettings.port}/mcp"
+                mapOf(
+                    "BURP_MCP_PORT" to mcpSettings.port.toString(),
+                    "BURP_MCP_HOST" to mcpSettings.host,
+                    "BURP_MCP_TOKEN" to mcpSettings.token,
+                    "BURP_MCP_API_URL" to url,
+                    "MCP_SERVER_URL" to url,
+                    "MCP_SERVER" to url,
+                    "MCP_TOKEN" to mcpSettings.token,
+                )
+            } else {
+                emptyMap()
+            }
+
+        val baseEnv =
+            mapOf(
+                "BURP_AI_AGENT_SESSION_ID" to sessionId,
+                "BURP_AI_AGENT_DETERMINISM" to determinism.toString(),
+                "PATH" to buildCliPathStatic(),
+            ) + mcpEnv
+
+        return when (backendId) {
+            "burp-ai" ->
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "Burp AI (built-in)",
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = baseEnv,
+                )
+            "codex-cli" -> {
+                val cmd = (settings?.codexCmd ?: prefs.getString("codex.cmd") ?: "codex").trim()
+                val env = embeddedCliEnv(baseEnv, embeddedMode)
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "Codex CLI",
+                    command = tokenizeCommand(cmd),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = env,
+                    cliSessionId = cliSessionId,
+                )
+            }
+            "gemini-cli" -> {
+                val cmd = (settings?.geminiCmd ?: prefs.getString("gemini.cmd") ?: "gemini").trim()
+                val env = embeddedCliEnv(baseEnv, embeddedMode)
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "Gemini CLI",
+                    command = tokenizeCommand(cmd),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = env,
+                    cliSessionId = cliSessionId,
+                )
+            }
+            "opencode-cli" -> {
+                val baseCmd = (settings?.opencodeCmd ?: prefs.getString("opencode.cmd") ?: "opencode").trim()
+                val cmdParts = tokenizeCommand(baseCmd)
+                val env = embeddedCliEnv(baseEnv, embeddedMode)
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "OpenCode CLI",
+                    command = cmdParts,
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = env,
+                    cliSessionId = cliSessionId,
+                )
+            }
+            "claude-cli" -> {
+                val cmd = (settings?.claudeCmd ?: prefs.getString("claude.cmd") ?: "claude").trim()
+                val env = embeddedCliEnv(baseEnv, embeddedMode)
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "Claude Code",
+                    command = tokenizeCommand(cmd),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = env,
+                    cliSessionId = cliSessionId,
+                )
+            }
+            "ollama" -> {
+                val url = (settings?.ollamaUrl ?: prefs.getString("ollama.url") ?: "http://127.0.0.1:11434").trim()
+                val explicitModel = (settings?.ollamaModel ?: prefs.getString("ollama.model")).orEmpty().trim()
+                val model = explicitModel.ifBlank { resolveOllamaModel(settings) }
+                val apiKey = settings?.ollamaApiKey ?: prefs.getString("ollama.apiKey").orEmpty()
+                val rawHeaders = settings?.ollamaHeaders ?: prefs.getString("ollama.headers").orEmpty()
+                val headers =
+                    HeaderParser.withBearerToken(
+                        apiKey,
+                        HeaderParser.parse(rawHeaders),
+                    )
+                val timeoutSeconds =
+                    settings?.ollamaTimeoutSeconds
+                        ?: (prefs.getInteger("ollama.timeoutSeconds") ?: Defaults.CLI_PROCESS_TIMEOUT_SECONDS)
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "Ollama",
+                    baseUrl = url,
+                    model = model,
+                    headers = headers,
+                    requestTimeoutSeconds = timeoutSeconds.toLong(),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = baseEnv,
+                    cliSessionId = cliSessionId,
+                    contextWindow =
+                        settings?.ollamaContextWindow
+                            ?: prefs.getInteger("ollama.contextWindow"),
+                    transport = httpTransport,
+                )
+            }
+            "lmstudio" -> {
+                val url = (settings?.lmStudioUrl ?: prefs.getString("lmstudio.url") ?: "http://127.0.0.1:1234").trim()
+                val model = (settings?.lmStudioModel ?: prefs.getString("lmstudio.model") ?: "lmstudio").trim()
+                val timeoutSeconds =
+                    settings?.lmStudioTimeoutSeconds
+                        ?: (prefs.getInteger("lmstudio.timeoutSeconds") ?: Defaults.CLI_PROCESS_TIMEOUT_SECONDS)
+                val apiKey = settings?.lmStudioApiKey ?: prefs.getString("lmstudio.apiKey").orEmpty()
+                val rawHeaders = settings?.lmStudioHeaders ?: prefs.getString("lmstudio.headers").orEmpty()
+                val headers =
+                    HeaderParser.withBearerToken(
+                        apiKey,
+                        HeaderParser.parse(rawHeaders),
+                    )
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "LM Studio",
+                    baseUrl = url,
+                    model = model,
+                    headers = headers,
+                    requestTimeoutSeconds = timeoutSeconds.toLong(),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = baseEnv,
+                    cliSessionId = cliSessionId,
+                    transport = httpTransport,
+                )
+            }
+            "openai-compatible" -> {
+                val url = (settings?.openAiCompatibleUrl ?: prefs.getString("openai.compat.url") ?: "").trim()
+                val model = (settings?.openAiCompatibleModel ?: prefs.getString("openai.compat.model") ?: "").trim()
+                val timeoutSeconds =
+                    settings?.openAiCompatibleTimeoutSeconds
+                        ?: (prefs.getInteger("openai.compat.timeoutSeconds") ?: Defaults.CLI_PROCESS_TIMEOUT_SECONDS)
+                val apiKey = settings?.openAiCompatibleApiKey ?: prefs.getString("openai.compat.apiKey").orEmpty()
+                val rawHeaders = settings?.openAiCompatibleHeaders ?: prefs.getString("openai.compat.headers").orEmpty()
+                val headers =
+                    HeaderParser.withBearerToken(
+                        apiKey,
+                        HeaderParser.parse(rawHeaders),
+                    )
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "Generic (OpenAI-compatible)",
+                    baseUrl = url,
+                    model = model,
+                    headers = headers,
+                    requestTimeoutSeconds = timeoutSeconds.toLong(),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = baseEnv,
+                    cliSessionId = cliSessionId,
+                    transport = httpTransport,
+                )
+            }
+            "nvidia-nim" -> {
+                val url = (settings?.nvidiaNimUrl ?: prefs.getString("nvidia.nim.url") ?: "https://integrate.api.nvidia.com").trim()
+                val model = (settings?.nvidiaNimModel ?: prefs.getString("nvidia.nim.model") ?: "").trim()
+                val timeoutSeconds =
+                    settings?.nvidiaNimTimeoutSeconds
+                        ?: (prefs.getInteger("nvidia.nim.timeoutSeconds") ?: Defaults.CLI_PROCESS_TIMEOUT_SECONDS)
+                val apiKey = settings?.nvidiaNimApiKey ?: prefs.getString("nvidia.nim.apiKey").orEmpty()
+                val rawHeaders = settings?.nvidiaNimHeaders ?: prefs.getString("nvidia.nim.headers").orEmpty()
+                val headers =
+                    HeaderParser.withBearerToken(
+                        apiKey,
+                        HeaderParser.parse(rawHeaders),
+                    )
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "NVIDIA NIM",
+                    baseUrl = url,
+                    model = model,
+                    headers = headers,
+                    requestTimeoutSeconds = timeoutSeconds.toLong(),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = baseEnv,
+                    cliSessionId = cliSessionId,
+                )
+            }
+            "perplexity" -> {
+                val url = (settings?.perplexityUrl ?: prefs.getString("perplexity.url") ?: "https://api.perplexity.ai").trim()
+                val model = (settings?.perplexityModel ?: prefs.getString("perplexity.model") ?: "").trim()
+                val timeoutSeconds =
+                    settings?.perplexityTimeoutSeconds
+                        ?: (prefs.getInteger("perplexity.timeoutSeconds") ?: Defaults.CLI_PROCESS_TIMEOUT_SECONDS)
+                val apiKey = settings?.perplexityApiKey ?: prefs.getString("perplexity.apiKey").orEmpty()
+                val rawHeaders = settings?.perplexityHeaders ?: prefs.getString("perplexity.headers").orEmpty()
+                val headers =
+                    HeaderParser.withBearerToken(
+                        apiKey,
+                        HeaderParser.parse(rawHeaders),
+                    )
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "Perplexity",
+                    baseUrl = url,
+                    model = model,
+                    headers = headers,
+                    requestTimeoutSeconds = timeoutSeconds.toLong(),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = baseEnv,
+                    cliSessionId = cliSessionId,
+                )
+            }
+            "copilot-cli" -> {
+                val cmd = (settings?.copilotCmd ?: prefs.getString("copilot.cmd") ?: "copilot").trim()
+                val env = embeddedCliEnv(baseEnv, embeddedMode)
+                BackendLaunchConfig(
+                    backendId = backendId,
+                    displayName = "Copilot CLI",
+                    command = tokenizeCommand(cmd),
+                    embeddedMode = embeddedMode,
+                    sessionId = sessionId,
+                    determinismMode = determinism,
+                    env = env,
+                    cliSessionId = cliSessionId,
+                )
+            }
+            else -> BackendLaunchConfig(backendId, backendId, embeddedMode = embeddedMode, env = baseEnv, cliSessionId = cliSessionId)
+        }
+    }
+
+    private fun embeddedCliEnv(
+        baseEnv: Map<String, String>,
+        embeddedMode: Boolean,
+    ): Map<String, String> {
+        if (!embeddedMode) return baseEnv
+        return baseEnv +
+            mapOf(
+                "CI" to "1",
+                "TERM" to "dumb",
+                "NO_COLOR" to "1",
+                "CLICOLOR" to "0",
+                "FORCE_COLOR" to "0",
+                "BURP_AI_AGENT_EMBEDDED" to "1",
+            )
+    }
+
+    private fun resolveOllamaModel(settings: AgentSettings?): String {
+        val cmd = settings?.ollamaCliCmd?.trim().orEmpty()
+        val fromCmd = parseOllamaModelFromCli(cmd)
+        if (!fromCmd.isNullOrBlank()) return fromCmd
+        return "llama3.1"
+    }
+
+    private fun parseOllamaModelFromCli(cmd: String): String? {
+        if (cmd.isBlank()) return null
+        val parts = tokenizeCommand(cmd)
+        val runIdx = parts.indexOf("run")
+        if (runIdx >= 0 && runIdx + 1 < parts.size) {
+            val candidate = parts[runIdx + 1]
+            return if (candidate.startsWith("-")) null else candidate
+        }
+        if (parts.size >= 3 && parts[0] == "ollama" && parts[1] == "run") {
+            return parts[2]
+        }
+        return null
+    }
+
+    private fun checkHealth() {
+        // Snapshot state atomically — if it's not Running, skip
+        val current = stateRef.get() as? AgentState.Running ?: return
+
+        if (current.connection.isAlive()) {
+            val startedAt = current.startedAt
+            if (startedAt > 0 && System.currentTimeMillis() - startedAt > 5_000) {
+                crashCount.set(0)
+                autoRestartSuppressed.set(null)
+                immediateCrashCount.set(0)
+            }
+            return
+        }
+
+        // Verify state hasn't changed since we checked isAlive (another thread may have called stop())
+        if (stateRef.get() !== current) return
+
+        val settings = settingsRef.get() ?: return
+        if (!settings.autoRestart) return
+        if (autoRestartSuppressed.get() != null) return
+
+        val startedAt = current.startedAt
+        val now = System.currentTimeMillis()
+        val immediateCrash = startedAt > 0 && (now - startedAt) < 5_000
+
+        val failures = crashCount.get().coerceAtLeast(1)
+        val backoffMs = (1000L * (1 shl failures.coerceAtMost(5))).coerceAtMost(30_000L)
+        val last = lastRestartAt.get()
+        if (now - last < backoffMs) return
+
+        val attempt = crashCount.incrementAndGet()
+        val backendId = current.backendId
+
+        if (immediateCrash) {
+            val immediate = immediateCrashCount.incrementAndGet()
+            val detail = buildExitDetail(current.connection)
+            if (detail.isNotBlank()) {
+                api.logging().logToError("Agent exited immediately: $backendId.$detail")
+            }
+            if (immediate >= 3) {
+                val msg = "Auto-restart suppressed: $backendId exits immediately. Check CLI config/auth.$detail"
+                autoRestartSuppressed.set(msg)
+                lastErrorRef.set(msg)
+                api.logging().logToError(msg)
+                return
+            }
+        } else {
+            immediateCrashCount.set(0)
+        }
+
+        lastRestartAt.set(now)
+        api.logging().logToError("Agent crashed. Auto-restarting in ${backoffMs}ms (attempt $attempt).")
+
+        workerPool.submit { startOrAttach(backendId) }
+    }
+
+    private fun buildExitDetail(conn: AgentConnection): String {
+        if (conn !is DiagnosableConnection) return ""
+        val code = conn.exitCode()?.let { " exit=$it" }.orEmpty()
+        val tail = conn.lastOutputTail()?.let { "\nOutput:\n$it" }.orEmpty()
+        return if (code.isNotBlank() || tail.isNotBlank()) "$code$tail" else ""
+    }
+
+    private fun startService(
+        name: String,
+        cmd: String,
+    ): Boolean {
+        val existing = services[name]
+        if (existing != null && existing.isAlive) return true
+        val parts = tokenizeCommand(cmd)
+        if (parts.isEmpty()) return false
+        return try {
+            val process =
+                ProcessBuilder(parts)
+                    .redirectErrorStream(true)
+                    .start()
+            services[name] = process
+            workerPool.submit {
+                try {
+                    process.inputStream.bufferedReader().use { reader ->
+                        reader.forEachLine { line ->
+                            safeLogOutput("[$name] $line")
+                        }
+                    }
+                } catch (e: Exception) {
+                    safeLogOutput("[$name] output stream closed: ${e.message}")
+                }
+            }
+            safeLogOutput("Started service: $name")
+            true
+        } catch (e: Exception) {
+            safeLogError("Failed to start service $name: ${e.message}")
+            false
+        }
+    }
+
+    private fun tokenizeCommand(command: String): List<String> {
+        val tokens = mutableListOf<String>()
+        val currentToken = StringBuilder()
+        var inQuotes = false
+        var quoteChar = ' '
+
+        var i = 0
+        while (i < command.length) {
+            val c = command[i]
+            when {
+                c == '\\' && i + 1 < command.length -> {
+                    currentToken.append(command[i + 1])
+                    i++
+                }
+                (c == '"' || c == '\'') -> {
+                    if (inQuotes) {
+                        if (c == quoteChar) {
+                            inQuotes = false
+                        } else {
+                            currentToken.append(c)
+                        }
+                    } else {
+                        inQuotes = true
+                        quoteChar = c
+                    }
+                }
+                c.isWhitespace() -> {
+                    if (inQuotes) {
+                        currentToken.append(c)
+                    } else if (currentToken.isNotEmpty()) {
+                        tokens.add(currentToken.toString())
+                        currentToken.clear()
+                    }
+                }
+                else -> {
+                    currentToken.append(c)
+                }
+            }
+            i++
+        }
+        if (currentToken.isNotEmpty()) {
+            tokens.add(currentToken.toString())
+        }
+        return tokens
+    }
+
+    private fun safeLogOutput(message: String) {
+        try {
+            api.logging().logToOutput(message)
+        } catch (_: Throwable) {
+            System.err.println(message)
+        }
+    }
+
+    private fun safeLogError(message: String) {
+        try {
+            api.logging().logToError(message)
+        } catch (_: Throwable) {
+            System.err.println(message)
+        }
+    }
+
+    fun shutdown() {
+        stop()
+        chatSessionManager.shutdown()
+        monitorExec.shutdown()
+        try {
+            if (!monitorExec.awaitTermination(3, TimeUnit.SECONDS)) {
+                monitorExec.shutdownNow()
+            }
+        } catch (_: InterruptedException) {
+            monitorExec.shutdownNow()
+        }
+        for ((name, process) in services) {
+            try {
+                process.destroyForcibly()
+            } catch (e: Exception) {
+                safeLogError("Failed to terminate service '$name': ${e.message}")
+            }
+        }
+        services.clear()
+    }
+
+    companion object {
+        private val cachedPathRef = AtomicReference<String?>(null)
+
+        fun buildCliPathStatic(): String {
+            cachedPathRef.get()?.let { return it }
+
+            val initialBase = System.getenv("PATH").orEmpty()
+            val userHome = System.getProperty("user.home")
+            val sep = java.io.File.pathSeparator
+            val os = System.getProperty("os.name").lowercase(java.util.Locale.ROOT)
+            val isWin = os.contains("win")
+
+            if (isWin) {
+                cachedPathRef.compareAndSet(null, initialBase)
+                return cachedPathRef.get()!!
+            }
+
+            // On Unix (macOS/Linux), Burp often has a truncated PATH if not started from terminal.
+            val capturedPath = capturePathFromShells() ?: initialBase
+
+            // Merge everything and inject common local folders that are often missed
+            val rawList = (capturedPath.split(sep) + initialBase.split(sep)).toMutableList()
+
+            val commonFolders =
+                listOf(
+                    "~/.local/bin",
+                    "~/bin",
+                    "/opt/homebrew/bin",
+                    "/usr/local/bin",
+                )
+
+            for (f in commonFolders) {
+                val expanded = expandHome(f, userHome)
+                if (java.io.File(expanded).exists()) {
+                    rawList.add(expanded)
+                }
+            }
+
+            val finalPath = rawList.filter { it.isNotBlank() }.distinct().joinToString(sep)
+
+            // Atomic set — first thread wins, subsequent calls use the cached value
+            cachedPathRef.compareAndSet(null, finalPath)
+            return cachedPathRef.get()!!
+        }
+
+        private fun expandHome(
+            path: String,
+            home: String,
+        ): String =
+            if (path.startsWith("~")) {
+                home + path.substring(1)
+            } else {
+                path
+            }
+
+        private fun capturePathFromShells(): String? {
+            val shells =
+                listOf(
+                    System.getenv("SHELL"),
+                    "/bin/zsh",
+                    "/usr/bin/zsh",
+                    "/bin/bash",
+                    "/usr/bin/bash",
+                    "/bin/sh",
+                ).filterNotNull().distinct()
+
+            for (shellPath in shells) {
+                if (!java.io.File(shellPath).exists()) continue
+
+                // Strategy A: Standard login shell
+                val captured = tryCapture(shellPath, listOf("-l", "-c", "echo ___BURP_PATH___\$PATH"))
+                if (!captured.isNullOrBlank()) return captured
+
+                // Strategy B: Explicit source (often needed for macOS GUI apps)
+                if (shellPath.endsWith("zsh")) {
+                    val fallback = tryCapture(shellPath, listOf("-c", "source ~/.zshrc 2>/dev/null; echo ___BURP_PATH___\$PATH"))
+                    if (!fallback.isNullOrBlank()) return fallback
+                }
+            }
+            return null
+        }
+
+        private fun tryCapture(
+            shellPath: String,
+            args: List<String>,
+        ): String? {
+            try {
+                val process = ProcessBuilder(listOf(shellPath) + args).start()
+                val output = process.inputStream.bufferedReader().use { it.readText() }
+                if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                    process.destroyForcibly()
+                    return null
+                }
+                if (process.exitValue() == 0 && output.contains("___BURP_PATH___")) {
+                    val result = output.substringAfter("___BURP_PATH___").substringBefore("\n").trim()
+                    if (result.isNotBlank()) {
+                        return result
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            return null
+        }
+    }
+}
