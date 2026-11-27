@@ -1,0 +1,33 @@
+# Gradle & Build
+.gradle/
+build/
+out/
+target/
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE & Editors
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local config & Secrets
+.env
+.env.*
+local.properties
+*.key
+*.pem
+
+# Logs & Planning
+*.log
+.planning/
